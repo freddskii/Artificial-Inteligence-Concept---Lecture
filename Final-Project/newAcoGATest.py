@@ -557,6 +557,12 @@ class UnifiedDrone:
         with self.lock:
             self.neighbor_drones[neighbor_id] = link_metrics
 
+    def reset_pheromones(self):
+        """Reset all pheromones to initial values"""
+        with self.lock:
+            self.pheromone_table_aco = {}
+            self.routing_table_aco = {}
+
 # ============= COMPARISON CONTROLLER =============
 
 class ACOvsGAController:
@@ -663,7 +669,8 @@ class ACOvsGAController:
             drone.update_position(new_position)
 
     # Advanced ACO routing test
-    def test_aco_routing(self, source_id: str, dest_id: str) -> RouteResult:
+    # RENAMED from test_aco_routing
+    def _send_single_ant_aco(self, source_id: str, dest_id: str) -> RouteResult:
         start_time = time.time()
         source_drone = self.drones[source_id]
         dest_drone = self.drones[dest_id]
@@ -705,6 +712,63 @@ class ACOvsGAController:
                 path_quality=path_quality
             )
         else:
+            return RouteResult(
+                algorithm=AlgorithmType.ACO,
+                source=source_id,
+                destination=dest_id,
+                route=None,
+                latency=time.time() - start_time,
+                hop_count=0,
+                success=False,
+                timestamp=time.time(),
+                path_quality=0.0
+            )
+        
+    def test_aco_routing(self, source_id: str, dest_id: str) -> RouteResult:
+        """
+        Runs a full ACO search for a specific route over a set duration.
+        This is the "head-to-head" competitor to test_ga_routing.
+        """
+        start_time = time.time()
+        
+        # --- THIS IS THE CRITICAL FIX ---
+        # Reset all pheromones to give ACO a fresh start,
+        # making it a fair comparison against the stateless GA.
+        self.reset_all_pheromones()
+        # --- END OF FIX ---
+
+        # --- Parameters for the test ---
+        test_duration = 2.0  # Give ACO 2 seconds to find the best route
+        ants_per_second = 25 # Send 25 ants per second
+        ant_interval = 1.0 / ants_per_second
+        # ---------------------------------
+        
+        successful_routes: List[RouteResult] = []
+        last_ant_time = 0.0
+        
+        while (time.time() - start_time) < test_duration:
+            current_test_time = time.time() - start_time
+            
+            # Send ants periodically
+            if current_test_time >= last_ant_time + ant_interval:
+                result = self._send_single_ant_aco(source_id, dest_id)
+                if result.success:
+                    successful_routes.append(result)
+                last_ant_time = current_test_time
+            
+            # Don't sleep the full 0.1, just enough to not block
+            time.sleep(0.01) 
+        
+        # After 2 seconds, find the best route found
+        if successful_routes:
+            # Find the route with the highest path quality
+            best_route = max(successful_routes, key=lambda r: r.path_quality)
+            
+            # Set the latency to the *total* time the search took
+            best_route.latency = time.time() - start_time
+            return best_route
+        else:
+            # No route was found in the 2-second window
             return RouteResult(
                 algorithm=AlgorithmType.ACO,
                 source=source_id,
@@ -1016,11 +1080,6 @@ class ACOvsGAController:
                     self.run_comparison_test()
                     self.last_test_time = self.simulation_time
                 
-                # === THIS IS THE FIX ===
-                # Run the ACO learning cycle on *every* simulation tick
-                self.run_aco_learning_cycle(num_ants=5)
-                # === END OF FIX ===
-                
                 # Update network
                 self.update_drone_positions()
                 self.update_neighbor_relationships()
@@ -1239,6 +1298,11 @@ class ACOvsGAController:
                 backward_ant = BackwardAnt(ant)
                 backward_ant.calculate_path_metrics()
                 backward_ant.update_pheromones(self.drones)
+
+    def reset_all_pheromones(self):
+        """Calls reset_pheromones on every drone in the network."""
+        for drone in self.drones.values():
+            drone.reset_pheromones()
 
 
 # ============= IMPROVED INTERACTIVE PLACEMENT GUI =============
