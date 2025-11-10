@@ -379,17 +379,20 @@ class DroneSwarmACOController:
         print("Swarm initialization completed!")
 
     def add_drone_manual(self, x: float, y: float, z: float, drone_type: DroneType):
-        """Add a drone manually at specific coordinates"""
+        """Add a drone manually at specific coordinates - FIXED"""
         if drone_type == DroneType.LEADER:
-            drone_id = f"leader_{sum(1 for d in self.drones.values() if d.drone_type == DroneType.LEADER)}"
+            existing_count = sum(1 for d in self.drones.values() if d.drone_type == DroneType.LEADER)
+            drone_id = f"leader_{existing_count}"
             initial_energy = 150.0
         else:
-            drone_id = f"worker_{sum(1 for d in self.drones.values() if d.drone_type == DroneType.WORKER)}"
+            existing_count = sum(1 for d in self.drones.values() if d.drone_type == DroneType.WORKER)
+            drone_id = f"worker_{existing_count}"
             initial_energy = 100.0
         
         position = Position(x, y, z)
-        self.drones[drone_id] = IntelligentDrone(drone_id, position, drone_type, initial_energy)
-        print(f"Added {drone_type.value} drone at ({x:.0f}, {y:.0f}, {z:.0f})")
+        new_drone = IntelligentDrone(drone_id, position, drone_type, initial_energy)
+        self.drones[drone_id] = new_drone
+        print(f"Added {drone_type.value.upper()} drone '{drone_id}' at ({x:.0f}, {y:.0f}, {z:.0f})")
 
     def update_neighbor_relationships(self):
         drone_ids = list(self.drones.keys())
@@ -536,6 +539,8 @@ class DroneSwarmACOController:
                 latency = time.time() - packet['timestamp']
                 self.performance_metrics['average_latency'].append(latency)
                 break
+        
+        return path
 
     def adaptive_parameter_tuning(self):
         total_drones = len(self.drones)
@@ -575,39 +580,54 @@ class DroneSwarmACOController:
             print(f"Total Ants Processed: {total_ants}")
 
     def visualize_network(self):
+        """Visualize network with drone names - FIXED"""
         try:
-            plt.figure(figsize=(12, 8))
+            plt.figure(figsize=(14, 10))
             
             for drone_id, drone in self.drones.items():
                 color = 'red' if drone.drone_type == DroneType.LEADER else 'blue'
                 marker = 's' if drone.drone_type == DroneType.LEADER else 'o'
-                size = 100 if drone.drone_type == DroneType.LEADER else 50
+                size = 150 if drone.drone_type == DroneType.LEADER else 100
                 
                 plt.scatter(drone.position.x, drone.position.y, c=color, 
-                          marker=marker, s=size, alpha=0.7)
+                          marker=marker, s=size, alpha=0.7, edgecolors='black', linewidth=1.5)
+                
+                # Drone name label
+                plt.text(drone.position.x, drone.position.y + 80, 
+                        drone_id, fontsize=9, ha='center', fontweight='bold',
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8, edgecolor='black'))
+                
+                # Battery level
+                plt.text(drone.position.x, drone.position.y - 80, 
+                        f"{drone.battery_level:.0f}%", fontsize=8, ha='center',
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow', alpha=0.7))
                 
                 for neighbor_id in drone.neighbor_drones.keys():
                     if neighbor_id in self.drones:
                         neighbor = self.drones[neighbor_id]
                         plt.plot([drone.position.x, neighbor.position.x],
-                                [drone.position.y, neighbor.position.y], 'gray', alpha=0.3)
+                                [drone.position.y, neighbor.position.y], 'gray', alpha=0.3, linewidth=1)
             
-            plt.title(f"Drone Swarm Network - Time: {self.simulation_time}")
-            plt.xlabel("X Position (m)")
-            plt.ylabel("Y Position (m)")
+            leader_count = sum(1 for d in self.drones.values() if d.drone_type == DroneType.LEADER)
+            worker_count = sum(1 for d in self.drones.values() if d.drone_type == DroneType.WORKER)
+            
+            title = f"Drone Swarm Network - Time: {self.simulation_time}s\n"
+            title += f"Leaders: {leader_count} | Workers: {worker_count} | Total: {len(self.drones)}"
+            plt.title(title, fontsize=13, fontweight='bold')
+            
+            plt.xlabel("X Position (m)", fontsize=11)
+            plt.ylabel("Y Position (m)", fontsize=11)
             plt.grid(True, alpha=0.3)
             
             red_patch = mpatches.Patch(color='red', label='Leader Drones')
             blue_patch = mpatches.Patch(color='blue', label='Worker Drones')
-            plt.legend(handles=[red_patch, blue_patch])
+            plt.legend(handles=[red_patch, blue_patch], fontsize=10)
             
             plt.tight_layout()
             plt.show()
             
         except Exception as e:
             print(f"Visualization error: {e}")
-
-
 
     def test_routing_between_drones(self, source_id: Optional[str] = None, 
                                     destination_id: Optional[str] = None):
@@ -618,20 +638,17 @@ class DroneSwarmACOController:
         
         drone_ids = list(self.drones.keys())
         
-        # If not specified, pick random source and destination
         if source_id is None:
             source_id = random.choice(drone_ids)
         if destination_id is None:
             destination_id = random.choice([did for did in drone_ids if did != source_id])
         
-        # Verify drones exist
         if source_id not in self.drones or destination_id not in self.drones:
             print(f"ERROR: Invalid drone IDs")
             return
         
         print(f"\nTesting route from {source_id} to {destination_id}...")
         
-        # Visualize the routing path
         self.visualize_routing_path(source_id, destination_id)
 
     def visualize_routing_path(self, source_id: str, destination_id: str, show_all_connections: bool = True):
@@ -640,7 +657,6 @@ class DroneSwarmACOController:
             print(f"ERROR: Source or destination drone not found!")
             return
         
-        # Create a packet to route
         packet = {
             'source': source_id,
             'destination': destination_id,
@@ -649,18 +665,15 @@ class DroneSwarmACOController:
             'priority': 'high'
         }
         
-        # Get the routing path
         path = self.route_data_packet(packet)
         
         if not path:
             print(f"No route found from {source_id} to {destination_id}")
             return
         
-        # Create visualization
         plt.figure(figsize=(14, 10))
         ax = plt.gca()
         
-        # Draw all drones
         for drone_id, drone in self.drones.items():
             if drone.drone_type == DroneType.LEADER:
                 color = 'red'
@@ -673,7 +686,6 @@ class DroneSwarmACOController:
                 size = 100
                 alpha = 0.3
             
-            # Highlight source and destination
             if drone_id == source_id:
                 color = 'green'
                 alpha = 1.0
@@ -689,7 +701,6 @@ class DroneSwarmACOController:
                        c=color, marker=marker, s=size, alpha=alpha,
                        edgecolors='black', linewidth=1.5, zorder=3)
             
-            # Add labels
             label_color = 'black' if drone_id in path or drone_id in [source_id, destination_id] else 'gray'
             fontsize = 10 if drone_id in path or drone_id in [source_id, destination_id] else 8
             fontweight = 'bold' if drone_id in path or drone_id in [source_id, destination_id] else 'normal'
@@ -699,7 +710,6 @@ class DroneSwarmACOController:
                     color=label_color, fontweight=fontweight,
                     bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7))
         
-        # Draw all neighbor connections (optional)
         if show_all_connections:
             for drone_id, drone in self.drones.items():
                 for neighbor_id in drone.neighbor_drones.keys():
@@ -709,17 +719,14 @@ class DroneSwarmACOController:
                                [drone.position.y, neighbor.position.y], 
                                'gray', alpha=0.15, linewidth=0.5, zorder=1)
         
-        # Draw the routing path with arrows
         for i in range(len(path) - 1):
             current_drone = self.drones[path[i]]
             next_drone = self.drones[path[i + 1]]
             
-            # Draw thick line for the path
             plt.plot([current_drone.position.x, next_drone.position.x],
                     [current_drone.position.y, next_drone.position.y],
                     'purple', linewidth=4, alpha=0.7, zorder=2)
             
-            # Add arrow
             dx = next_drone.position.x - current_drone.position.x
             dy = next_drone.position.y - current_drone.position.y
             plt.arrow(current_drone.position.x, current_drone.position.y,
@@ -727,14 +734,12 @@ class DroneSwarmACOController:
                      head_width=50, head_length=50, fc='purple', 
                      ec='purple', alpha=0.7, zorder=2, linewidth=2)
             
-            # Add hop number
             mid_x = (current_drone.position.x + next_drone.position.x) / 2
             mid_y = (current_drone.position.y + next_drone.position.y) / 2
             plt.text(mid_x, mid_y, f"Hop {i+1}", fontsize=9,
                     bbox=dict(boxstyle='round,pad=0.4', facecolor='yellow', alpha=0.8),
                     ha='center', fontweight='bold', zorder=4)
         
-        # Create legend
         from matplotlib.lines import Line2D
         legend_elements = [
             Line2D([0], [0], marker='o', color='w', label=f'Source: {source_id}',
@@ -750,7 +755,6 @@ class DroneSwarmACOController:
         
         plt.legend(handles=legend_elements, loc='upper right', fontsize=10)
         
-        # Title with path info
         path_success = "SUCCESS" if path[-1] == destination_id else "FAILED"
         title = f"Routing Path Visualization - {path_success}\n"
         title += f"Source: {source_id} → Destination: {destination_id}\n"
@@ -763,7 +767,6 @@ class DroneSwarmACOController:
         plt.tight_layout()
         plt.show()
         
-        # Print path details
         print("\n" + "="*60)
         print("ROUTING PATH DETAILS")
         print("="*60)
@@ -778,37 +781,6 @@ class DroneSwarmACOController:
             print(f"Status: ✗ Packet delivery failed (no route)")
         
         print("="*60 + "\n")
-        try:
-            plt.figure(figsize=(12, 8))
-            
-            for drone_id, drone in self.drones.items():
-                color = 'red' if drone.drone_type == DroneType.LEADER else 'blue'
-                marker = 's' if drone.drone_type == DroneType.LEADER else 'o'
-                size = 100 if drone.drone_type == DroneType.LEADER else 50
-                
-                plt.scatter(drone.position.x, drone.position.y, c=color, 
-                          marker=marker, s=size, alpha=0.7)
-                
-                for neighbor_id in drone.neighbor_drones.keys():
-                    if neighbor_id in self.drones:
-                        neighbor = self.drones[neighbor_id]
-                        plt.plot([drone.position.x, neighbor.position.x],
-                                [drone.position.y, neighbor.position.y], 'gray', alpha=0.3)
-            
-            plt.title(f"Drone Swarm Network - Time: {self.simulation_time}")
-            plt.xlabel("X Position (m)")
-            plt.ylabel("Y Position (m)")
-            plt.grid(True, alpha=0.3)
-            
-            red_patch = mpatches.Patch(color='red', label='Leader Drones')
-            blue_patch = mpatches.Patch(color='blue', label='Worker Drones')
-            plt.legend(handles=[red_patch, blue_patch])
-            
-            plt.tight_layout()
-            plt.show()
-            
-        except Exception as e:
-            print(f"Visualization error: {e}")
 
     def run_simulation(self, duration: int = 300):
         print("Starting Drone Swarm ACO Simulation...")
@@ -891,9 +863,9 @@ class InteractiveDronePlacementGUI:
     def __init__(self, area_size: Tuple[float, float] = (2000, 2000)):
         self.area_size = area_size
         self.controller = DroneSwarmACOController()
-        self.placement_mode = DroneType.WORKER  # Start with worker mode
+        self.placement_mode = DroneType.WORKER
         self.fig, self.ax = None, None
-        self.z_height = 150.0  # Default altitude
+        self.z_height = 150.0
         
     def start_placement_interface(self):
         """Start the interactive placement interface"""
@@ -913,11 +885,9 @@ class InteractiveDronePlacementGUI:
         print(f"Initial mode: {self.placement_mode.value.upper()}")
         print(f"Initial altitude: {self.z_height}m\n")
         
-        # Create figure and axis
         self.fig, self.ax = plt.subplots(figsize=(14, 10))
         self.fig.canvas.manager.set_window_title('Drone Swarm Placement Interface')
         
-        # Set up the plot
         self.ax.set_xlim(0, self.area_size[0])
         self.ax.set_ylim(0, self.area_size[1])
         self.ax.set_xlabel('X Position (meters)', fontsize=12)
@@ -925,17 +895,12 @@ class InteractiveDronePlacementGUI:
         self.ax.grid(True, alpha=0.3, linestyle='--')
         self.ax.set_aspect('equal')
         
-        # Initial title
         self._update_title()
         
-        # Connect event handlers
         self.fig.canvas.mpl_connect('button_press_event', self._on_click)
         self.fig.canvas.mpl_connect('key_press_event', self._on_key)
         
-        # Add legend
         self._add_legend()
-        
-        # Add instruction text
         self._add_instructions()
         
         plt.tight_layout()
@@ -977,13 +942,11 @@ class InteractiveDronePlacementGUI:
         if event.inaxes != self.ax:
             return
             
-        if event.button == 1:  # Left click
+        if event.button == 1:
             x, y = event.xdata, event.ydata
             
-            # Add drone at clicked position
             self.controller.add_drone_manual(x, y, self.z_height, self.placement_mode)
             
-            # Redraw the visualization
             self._redraw_drones()
             
     def _on_key(self, event):
@@ -1033,7 +996,6 @@ class InteractiveDronePlacementGUI:
         """Redraw all drones and their communication ranges"""
         self.ax.clear()
         
-        # Reset plot settings
         self.ax.set_xlim(0, self.area_size[0])
         self.ax.set_ylim(0, self.area_size[1])
         self.ax.set_xlabel('X Position (meters)', fontsize=12)
@@ -1041,7 +1003,6 @@ class InteractiveDronePlacementGUI:
         self.ax.grid(True, alpha=0.3, linestyle='--')
         self.ax.set_aspect('equal')
         
-        # Draw communication ranges first (as circles)
         for drone in self.controller.drones.values():
             color = 'red' if drone.drone_type == DroneType.LEADER else 'blue'
             circle = Circle((drone.position.x, drone.position.y), 
@@ -1050,7 +1011,6 @@ class InteractiveDronePlacementGUI:
                           fill=True, linewidth=1)
             self.ax.add_patch(circle)
         
-        # Draw drones
         for drone in self.controller.drones.values():
             if drone.drone_type == DroneType.LEADER:
                 color = 'red'
@@ -1065,7 +1025,6 @@ class InteractiveDronePlacementGUI:
                           c=color, marker=marker, s=size, 
                           alpha=0.7, edgecolors='black', linewidth=1.5)
             
-            # Add drone ID label
             self.ax.text(drone.position.x, drone.position.y + 50, 
                         drone.drone_id, fontsize=8, ha='center',
                         bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7))
@@ -1082,14 +1041,11 @@ class InteractiveDronePlacementGUI:
         print("INITIALIZING SIMULATION")
         print("="*60)
         
-        # Update neighbor relationships
         self.controller.update_neighbor_relationships()
         
-        # Show initial network visualization
         print("\nShowing initial network configuration...")
         self.controller.visualize_network()
         
-        # Ask user what to do
         print("\nWhat would you like to do?")
         print("1. Run full simulation")
         print("2. Test routing between specific drones")
@@ -1101,7 +1057,6 @@ class InteractiveDronePlacementGUI:
             choice = "1"
         
         if choice == "2":
-            # Test specific routing
             print("\nAvailable drones:")
             for drone_id in self.controller.drones.keys():
                 print(f"  - {drone_id}")
@@ -1114,7 +1069,6 @@ class InteractiveDronePlacementGUI:
                 print("Invalid input, using random drones...")
                 self.controller.test_routing_between_drones()
             
-            # Ask if they want to run simulation after
             try:
                 run_sim = input("\nRun full simulation? (y/n, default n): ").strip().lower()
             except:
@@ -1124,10 +1078,8 @@ class InteractiveDronePlacementGUI:
                 return
         
         elif choice == "3":
-            # Test random routing
             self.controller.test_routing_between_drones()
             
-            # Ask if they want to run simulation after
             try:
                 run_sim = input("\nRun full simulation? (y/n, default n): ").strip().lower()
             except:
@@ -1136,21 +1088,17 @@ class InteractiveDronePlacementGUI:
             if run_sim != "y":
                 return
         
-        # Run full simulation
         print("\nHow long should the simulation run?")
         try:
             duration = int(input("Enter duration in seconds (default 60): ") or "60")
         except ValueError:
             duration = 60
         
-        # Run the simulation
         self.controller.run_simulation(duration=duration)
         
-        # Show final network visualization
         print("\nShowing final network state...")
         self.controller.visualize_network()
         
-        # Option to test routing after simulation
         try:
             test_after = input("\nTest routing after simulation? (y/n, default n): ").strip().lower()
             if test_after == "y":
@@ -1159,14 +1107,12 @@ class InteractiveDronePlacementGUI:
             pass
 
 
-# Main execution
 if __name__ == "__main__":
     print("\n" + "="*60)
     print("  DRONE SWARM ACO ROUTING SIMULATION")
     print("  Interactive Placement Interface")
     print("="*60)
     
-    # Ask user for area size
     print("\nEnter simulation area dimensions:")
     try:
         width = float(input("Width (meters, default 2000): ") or "2000")
@@ -1175,6 +1121,5 @@ if __name__ == "__main__":
         width, height = 2000, 2000
         print("Using default area size: 2000m x 2000m")
     
-    # Create and start the GUI
     gui = InteractiveDronePlacementGUI(area_size=(width, height))
     gui.start_placement_interface()
