@@ -91,12 +91,24 @@ class BackwardAnt:
         self.timestamp = time.time()
         
     def calculate_path_metrics(self) -> Dict[str, float]:
-        if not self.forward_ant.path_taken:
+        # --- THIS IS THE FIX ---
+        # We must skip the first hop (the source node) in our calculation,
+        # because its link_quality is always a meaningless default of 1.0.
+        # We only care about the quality of the *links* we traversed.
+        
+        path_links = self.forward_ant.path_taken[1:] # Slice to skip hop 0
+        
+        if not path_links:
+            # The path was just the source node (ant failed immediately)
             return {}
             
-        total_quality = sum(hop['link_quality'] for hop in self.forward_ant.path_taken)
-        avg_quality = total_quality / len(self.forward_ant.path_taken)
-        hop_penalty = len(self.forward_ant.path_taken) * 0.1
+        total_quality = sum(hop['link_quality'] for hop in path_links)
+        avg_quality = total_quality / len(path_links) # Divide by the number of links
+        
+        # Hops are (nodes - 1), which is len(path_links)
+        hop_count = len(path_links) 
+        hop_penalty = hop_count * 0.1
+        # --- END OF FIX ---
         
         if self.emergency_flag:
             avg_quality *= 1.2
@@ -104,7 +116,7 @@ class BackwardAnt:
         self.path_quality_score = avg_quality - hop_penalty
         return {
             'quality_score': self.path_quality_score,
-            'hop_count': len(self.forward_ant.path_taken),
+            'hop_count': hop_count,
             'avg_quality': avg_quality
         }
         
@@ -196,11 +208,25 @@ class UnifiedDrone:
     
     # ===== ACO METHODS =====
     
-    def process_forward_ant_aco(self, ant: ForwardAnt) -> Optional[str]:
+    def process_forward_ant_aco(self, ant: ForwardAnt, drone_network: Dict[str, 'UnifiedDrone']) -> Optional[str]:
         with self.lock:
             self.ants_processed += 1
             
-            link_quality = 1.0
+            # === THIS IS THE FIX ===
+            # Calculate the real link quality of the hop we just made
+            # instead of just 'link_quality = 1.0'
+            link_quality = 1.0  # Default for the first hop (the source drone)
+            if ant.path_taken:
+                # If we have a path, find the previous drone
+                previous_drone_id = ant.path_taken[-1]['drone_id']
+                if previous_drone_id in self.neighbor_drones:
+                    # Get the quality of the link we just traversed
+                    link_metrics = self.neighbor_drones[previous_drone_id]
+                    link_quality = link_metrics.rssi / 100.0
+                else:
+                    # This node is no longer a neighbor (or was never), penalize
+                    link_quality = 0.1 
+            # === END OF FIX ===
             
             ant.record_hop(self.drone_id, link_quality, self.position)
             
@@ -214,9 +240,11 @@ class UnifiedDrone:
             if not available_neighbors:
                 return None
                 
+            # --- THIS CALL IS MODIFIED ---
             next_hop_id = self.advanced_routing_decision_aco(
-                available_neighbors, ant.destination_drone, ant.ant_type
+                available_neighbors, ant.destination_drone, drone_network, ant.ant_type
             )
+            # --- END MODIFICATION ---
             return next_hop_id
             
     def get_available_neighbors_aco(self, ant: ForwardAnt) -> List[str]:
@@ -231,6 +259,7 @@ class UnifiedDrone:
         
     def advanced_routing_decision_aco(self, available_neighbors: List[str], 
                                      destination: 'UnifiedDrone',
+                                     drone_network: Dict[str, 'UnifiedDrone'],
                                      ant_type: AntType = AntType.EXPLORATORY) -> str:
         if not available_neighbors:
             return None
@@ -256,11 +285,15 @@ class UnifiedDrone:
                 
             pheromone = self.pheromone_table_aco[destination.drone_id][neighbor_id]
             
-            if neighbor_id in self.neighbor_drones:
-                heuristic = 0.7
-            else:
-                heuristic = 0.5
-            
+            # === THIS IS THE FIX ===
+            # Calculate a real heuristic based on available link metrics
+            heuristic = 0.1  # Default low value
+            if neighbor_id in drone_network: # Use passed-in drone_network
+                neighbor_drone = drone_network[neighbor_id] # Use passed-in drone_network
+                # Use the actual heuristic calculation
+                heuristic = self.calculate_heuristic(neighbor_drone, destination)
+            # === END OF FIX ===
+
             probability = (pheromone ** alpha) * (heuristic ** beta)
             probabilities.append((neighbor_id, probability))
             total += probability
@@ -355,16 +388,35 @@ class InteractiveACOController:
     def update_neighbor_relationships(self):
         drone_ids = list(self.drones.keys())
         
+        # --- FIX: Clear all neighbor lists FIRST ---
+        for drone_id in drone_ids:
+            if drone_id in self.drones:
+                self.drones[drone_id].neighbor_drones.clear()
+        # --- END FIX ---
+        
         for i, drone_id1 in enumerate(drone_ids):
             drone1 = self.drones[drone_id1]
-            drone1.neighbor_drones.clear()
+            # The line 'drone1.neighbor_drones.clear()' was here and has been REMOVED
             
             for drone_id2 in drone_ids[i+1:]:
                 drone2 = self.drones[drone_id2]
                 distance = drone1.position.distance_to(drone2.position)
                 
-                if distance <= drone1.communication_range:
-                    link_quality = drone1.measure_link_quality(drone2)
+                # Check if EITHER drone can reach the other
+                max_range = max(drone1.communication_range, drone2.communication_range)
+                
+                if distance <= max_range:
+                    # Calculate quality based on the range that *made* the connection
+                    los_quality = 1.0 - (distance / max_range) ** 2
+                    
+                    signal_boost = 1.2 if (drone1.drone_type == DroneType.LEADER or 
+                                            drone2.drone_type == DroneType.LEADER) else 1.0
+                    
+                    energy_factor = min(drone1.battery_level, drone2.battery_level) / 100.0
+                    
+                    link_quality = los_quality * signal_boost * energy_factor
+                    link_quality = max(0.0, min(1.0, link_quality))
+
                     if link_quality > 0.1:
                         link_metrics = LinkMetrics(
                             rssi=link_quality * 100,
@@ -392,7 +444,9 @@ class InteractiveACOController:
         start_time = time.time()
         
         while current_drone and ant.should_continue() and (time.time() - start_time) < max_time:
-            next_hop_id = current_drone.process_forward_ant_aco(ant)
+            # --- THIS LINE IS MODIFIED ---
+            next_hop_id = current_drone.process_forward_ant_aco(ant, self.drones)
+            # --- END MODIFICATION ---
             
             if not next_hop_id or next_hop_id not in self.drones:
                 break
@@ -416,12 +470,23 @@ class InteractiveACOController:
                 'timestamp': time.time()
             }
         
-        return {'success': False}
+        return {'success': False, 'timestamp': time.time()}
 
     def run_round(self, source_id: str, dest_id: str, duration: int = 10, reset_pheromones: bool = False):
         """Run a single round of ACO simulation"""
         self.round_number += 1
         self.current_round_results = []
+        
+        # Validate connectivity before starting
+        if not self.check_path_exists(source_id, dest_id):
+            print(f"\n⚠️  WARNING: No physical path exists between {source_id} and {dest_id}!")
+            print("    The drones may be too far apart or disconnected.")
+            self.visualize_connectivity(source_id, dest_id)
+            
+            retry = input("\n    Continue anyway? (y/n, default=n): ").strip().lower()
+            if retry != 'y':
+                print("    Skipping this round.\n")
+                return
         
         if reset_pheromones:
             print("\n🔄 Resetting all pheromones to initial state...")
@@ -498,6 +563,12 @@ class InteractiveACOController:
             print(f"  Path: {' → '.join(best_route['route'])}")
             print(f"  Hops: {best_route['hop_count']}")
             print(f"  Quality: {best_route['path_quality']*100:.1f}%")
+        else:
+            print(f"\n❌ NO SUCCESSFUL ROUTES FOUND!")
+            print(f"   This usually means:")
+            print(f"   • Source and destination are too far apart")
+            print(f"   • No intermediate drones to relay the signal")
+            print(f"   • Network is disconnected")
         
         print(f"{'='*70}\n")
         
@@ -515,6 +586,104 @@ class InteractiveACOController:
         
         # Visualize this round
         self.visualize_round(source_id, dest_id)
+    
+    def check_path_exists(self, source_id: str, dest_id: str) -> bool:
+        """Check if a path exists using BFS"""
+        if source_id not in self.drones or dest_id not in self.drones:
+            return False
+        
+        if source_id == dest_id:
+            return True
+        
+        visited = set()
+        queue = deque([source_id])
+        visited.add(source_id)
+        
+        while queue:
+            current_id = queue.popleft()
+            current_drone = self.drones[current_id]
+            
+            if dest_id in current_drone.neighbor_drones:
+                return True
+            
+            for neighbor_id in current_drone.neighbor_drones.keys():
+                if neighbor_id not in visited:
+                    visited.add(neighbor_id)
+                    queue.append(neighbor_id)
+        
+        return False
+    
+    def visualize_connectivity(self, source_id: str, dest_id: str):
+        """Show network connectivity for debugging"""
+        print(f"\n🔍 CONNECTIVITY ANALYSIS:")
+        print(f"   Source: {source_id}")
+        
+        source_drone = self.drones[source_id]
+        print(f"   Position: ({source_drone.position.x:.0f}, {source_drone.position.y:.0f}, {source_drone.position.z:.0f})")
+        print(f"   Range: {source_drone.communication_range:.0f}m")
+        print(f"   Neighbors: {len(source_drone.neighbor_drones)}")
+        if source_drone.neighbor_drones:
+            for neighbor_id in list(source_drone.neighbor_drones.keys())[:5]:
+                neighbor = self.drones[neighbor_id]
+                distance = source_drone.position.distance_to(neighbor.position)
+                print(f"      • {neighbor_id} (distance: {distance:.0f}m)")
+        
+        print(f"\n   Destination: {dest_id}")
+        dest_drone = self.drones[dest_id]
+        print(f"   Position: ({dest_drone.position.x:.0f}, {dest_drone.position.y:.0f}, {dest_drone.position.z:.0f})")
+        print(f"   Range: {dest_drone.communication_range:.0f}m")
+        print(f"   Neighbors: {len(dest_drone.neighbor_drones)}")
+        if dest_drone.neighbor_drones:
+            for neighbor_id in list(dest_drone.neighbor_drones.keys())[:5]:
+                neighbor = self.drones[neighbor_id]
+                distance = dest_drone.position.distance_to(neighbor.position)
+                print(f"      • {neighbor_id} (distance: {distance:.0f}m)")
+        
+        # Direct distance
+        direct_distance = source_drone.position.distance_to(dest_drone.position)
+        print(f"\n   Direct distance: {direct_distance:.0f}m")
+        print(f"   Max single hop: {max(source_drone.communication_range, dest_drone.communication_range):.0f}m")
+        
+        if direct_distance <= source_drone.communication_range:
+            print(f"   ✓ Within direct range!")
+        else:
+            print(f"   ✗ Requires {(direct_distance / 1000):.1f} hops minimum")
+
+    def show_network_overview(self):
+        """Display network statistics"""
+        print(f"\n📊 NETWORK OVERVIEW:")
+        print(f"{'='*70}")
+        
+        total_drones = len(self.drones)
+        leaders = sum(1 for d in self.drones.values() if d.drone_type == DroneType.LEADER)
+        workers = total_drones - leaders
+        
+        print(f"Total drones: {total_drones}")
+        print(f"  Leaders: {leaders}")
+        print(f"  Workers: {workers}")
+        
+        # Connectivity stats
+        neighbor_counts = [len(d.neighbor_drones) for d in self.drones.values()]
+        if neighbor_counts:
+            print(f"\nConnectivity:")
+            print(f"  Avg neighbors per drone: {np.mean(neighbor_counts):.1f}")
+            print(f"  Min neighbors: {min(neighbor_counts)}")
+            print(f"  Max neighbors: {max(neighbor_counts)}")
+            
+            isolated = sum(1 for count in neighbor_counts if count == 0)
+            if isolated > 0:
+                print(f"  ⚠️  Isolated drones (0 neighbors): {isolated}")
+        
+        # Show isolated drones
+        isolated_drones = [drone_id for drone_id, drone in self.drones.items() 
+                          if len(drone.neighbor_drones) == 0]
+        if isolated_drones:
+            print(f"\n⚠️  WARNING: These drones are isolated:")
+            for drone_id in isolated_drones:
+                drone = self.drones[drone_id]
+                print(f"     • {drone_id} at ({drone.position.x:.0f}, {drone.position.y:.0f})")
+        
+        print(f"{'='*70}\n")
 
     def visualize_round(self, source_id: str, dest_id: str):
         """Visualize the network and routes from current round"""
@@ -690,6 +859,288 @@ class InteractiveACOController:
         print(f"🗺️  Pheromone map saved: {filename}")
         plt.show()
 
+    def visualize_network_static(self):
+        """Visualize the drone network's current state"""
+        if not self.drones:
+            print("❌ No drones to visualize.")
+            return
+        
+        print("📊 Generating static network visualization...")
+        plt.figure(figsize=(12, 10))
+        
+        for drone_id, drone in self.drones.items():
+            color = 'red' if drone.drone_type == DroneType.LEADER else 'blue'
+            marker = 's' if drone.drone_type == DroneType.LEADER else 'o'
+            size = 150 if drone.drone_type == DroneType.LEADER else 100
+            
+            plt.scatter(drone.position.x, drone.position.y, c=color, 
+                       marker=marker, s=size, alpha=0.7, edgecolors='black', linewidth=1.5)
+            
+            # Add drone ID label
+            plt.text(drone.position.x, drone.position.y + 60, 
+                    drone_id, fontsize=8, ha='center', fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8, edgecolor='black'))
+            
+            # Draw connections
+            for neighbor_id in drone.neighbor_drones.keys():
+                if neighbor_id in self.drones:
+                    neighbor = self.drones[neighbor_id]
+                    plt.plot([drone.position.x, neighbor.position.x],
+                            [drone.position.y, neighbor.position.y], 
+                            'gray', alpha=0.2, linewidth=0.5)
+        
+        leader_count = sum(1 for d in self.drones.values() if d.drone_type == DroneType.LEADER)
+        worker_count = sum(1 for d in self.drones.values() if d.drone_type == DroneType.WORKER)
+        
+        title = f"Static Drone Network Visualization\n"
+        title += f"Leaders: {leader_count} | Workers: {worker_count} | Total: {len(self.drones)}"
+        plt.title(title, fontsize=13, fontweight='bold')
+        
+        plt.xlabel("X Position (m)", fontsize=11)
+        plt.ylabel("Y Position (m)", fontsize=11)
+        plt.grid(True, alpha=0.3)
+        
+        red_patch = mpatches.Patch(color='red', label='Leader Drones')
+        blue_patch = mpatches.Patch(color='blue', label='Worker Drones')
+        plt.legend(handles=[red_patch, blue_patch], fontsize=10)
+        
+        plt.tight_layout()
+        plt.show()
+
+
+# ============= GRAPHICAL DRONE PLACEMENT GUI =============
+
+class GraphicalDronePlacement:
+    def __init__(self, area_size: Tuple[float, float] = (2000, 2000)):
+        self.area_size = area_size
+        self.controller = InteractiveACOController()
+        self.placement_mode = DroneType.WORKER
+        self.fig, self.ax = None, None
+        self.z_height = 150.0
+        self.mode_indicator = None
+        self.placement_complete = False
+        
+    def start_placement_interface(self):
+        print("\n" + "="*70)
+        print("GRAPHICAL DRONE PLACEMENT - ACO SIMULATOR")
+        print("="*70)
+        print("CONTROLS:")
+        print("  - LEFT CLICK: Place WORKER drone at cursor position")
+        print("  - RIGHT CLICK: Place LEADER drone at cursor position")
+        print("  - Press 'w': Switch to WORKER drone mode (left click)")
+        print("  - Press 'l': Switch to LEADER drone mode (left click)")
+        print("  - Press 'c': Clear all drones")
+        print("  - Press 'd': Done placing - start ACO simulation")
+        print("  - Press 'q': Quit without simulation")
+        print("  - Press '+'/'-': Adjust altitude (Z-height)")
+        print("="*70)
+        print(f"\nArea size: {self.area_size[0]}m x {self.area_size[1]}m")
+        print(f"Initial mode: {self.placement_mode.value.upper()} (left click)")
+        print(f"Initial altitude: {self.z_height}m")
+        print("\nTIP: Right-click always places LEADER drones!\n")
+        
+        self.fig, self.ax = plt.subplots(figsize=(14, 10))
+        self.fig.canvas.manager.set_window_title('ACO Simulator - Drone Placement')
+        
+        self.ax.set_xlim(0, self.area_size[0])
+        self.ax.set_ylim(0, self.area_size[1])
+        self.ax.set_xlabel('X Position (meters)', fontsize=12)
+        self.ax.set_ylabel('Y Position (meters)', fontsize=12)
+        self.ax.grid(True, alpha=0.3, linestyle='--')
+        self.ax.set_aspect('equal')
+        
+        self._update_title()
+        
+        self.fig.canvas.mpl_connect('button_press_event', self._on_click)
+        self.fig.canvas.mpl_connect('key_press_event', self._on_key)
+        
+        self._add_legend()
+        self._add_instructions()
+        self._draw_mode_indicator()
+        
+        plt.tight_layout()
+        plt.show()
+        
+        return self.placement_complete
+    
+    def _update_title(self):
+        leader_count = sum(1 for d in self.controller.drones.values() 
+                          if d.drone_type == DroneType.LEADER)
+        worker_count = sum(1 for d in self.controller.drones.values() 
+                          if d.drone_type == DroneType.WORKER)
+        
+        mode_str = f"*** {self.placement_mode.value.upper()} MODE (L-CLICK) ***"
+        title = f"ACO Simulator - {mode_str}\n"
+        title += f"Altitude: {self.z_height:.0f}m | Leaders: {leader_count} | Workers: {worker_count}"
+        
+        title_color = 'darkred' if self.placement_mode == DroneType.LEADER else 'darkblue'
+        self.ax.set_title(title, fontsize=14, fontweight='bold', color=title_color)
+    
+    def _draw_mode_indicator(self):
+        if self.mode_indicator:
+            self.mode_indicator.set_visible(False)
+        
+        color = 'red' if self.placement_mode == DroneType.LEADER else 'blue'
+        text = f"LEFT-CLICK: {self.placement_mode.value.upper()}\nRIGHT-CLICK: LEADER"
+        
+        self.mode_indicator = self.ax.text(
+            0.02, 0.98, text, 
+            transform=self.ax.transAxes,
+            fontsize=11, fontweight='bold', color=color,
+            verticalalignment='top',
+            bbox=dict(boxstyle='round,pad=0.8', facecolor='lightyellow', 
+                     alpha=0.9, edgecolor=color, linewidth=2),
+            zorder=10
+        )
+    
+    def _add_legend(self):
+        from matplotlib.lines import Line2D
+        
+        legend_elements = [
+            Line2D([0], [0], marker='s', color='w', label='Leader Drone (2000m range)',
+                   markerfacecolor='red', markersize=12, alpha=0.7),
+            Line2D([0], [0], marker='o', color='w', label='Worker Drone (1000m range)',
+                   markerfacecolor='blue', markersize=10, alpha=0.7),
+            Line2D([0], [0], color='gray', alpha=0.3, label='Communication Range', linewidth=2)
+        ]
+        
+        self.ax.legend(handles=legend_elements, loc='upper right', fontsize=10)
+    
+    def _add_instructions(self):
+        instructions = "L-Click=Mode | R-Click=Leader | w/l=Mode | c=Clear | d=Done | q=Quit | +/-=Alt"
+        self.ax.text(0.5, -0.08, instructions, transform=self.ax.transAxes,
+                    ha='center', fontsize=10, bbox=dict(boxstyle='round', 
+                    facecolor='wheat', alpha=0.5))
+    
+    def _on_click(self, event):
+        if event.inaxes != self.ax:
+            return
+        
+        if event.xdata is None or event.ydata is None:
+            return
+        
+        x, y = event.xdata, event.ydata
+        
+        # Check bounds
+        if not (0 <= x <= self.area_size[0] and 0 <= y <= self.area_size[1]):
+            return
+        
+        if event.button == 1:  # Left click - use current mode
+            self._add_drone(x, y, self.z_height, self.placement_mode)
+            print(f"✓ {self.placement_mode.value.upper()} drone placed at ({x:.0f}, {y:.0f}, {self.z_height:.0f})")
+        elif event.button == 3:  # Right click - always place LEADER
+            self._add_drone(x, y, self.z_height, DroneType.LEADER)
+            print(f"✓ LEADER drone placed at ({x:.0f}, {y:.0f}, {self.z_height:.0f}) [right-click]")
+        
+        self._redraw_drones()
+    
+    def _add_drone(self, x: float, y: float, z: float, drone_type: DroneType):
+        if drone_type == DroneType.LEADER:
+            existing_count = sum(1 for d in self.controller.drones.values() 
+                                if d.drone_type == DroneType.LEADER)
+            drone_id = f"leader_{existing_count}"
+            initial_energy = 150.0
+        else:
+            existing_count = sum(1 for d in self.controller.drones.values() 
+                                if d.drone_type == DroneType.WORKER)
+            drone_id = f"worker_{existing_count}"
+            initial_energy = 100.0
+        
+        position = Position(x, y, z)
+        new_drone = UnifiedDrone(drone_id, position, drone_type, initial_energy)
+        self.controller.drones[drone_id] = new_drone
+    
+    def _on_key(self, event):
+        if event.key == 'w':
+            self.placement_mode = DroneType.WORKER
+            print(f"\n>>> Switched to WORKER mode (altitude: {self.z_height}m) <<<")
+        elif event.key == 'l':
+            self.placement_mode = DroneType.LEADER
+            print(f"\n>>> Switched to LEADER mode (altitude: {self.z_height}m) <<<")
+        elif event.key == 'c':
+            self.controller.drones.clear()
+            print("\n>>> Cleared all drones <<<")
+            self._redraw_drones()
+            return
+        elif event.key == 'd':
+            if len(self.controller.drones) < 2:
+                print("\n❌ Need at least 2 drones to start simulation!")
+                return
+            print("\n>>> Finalizing placement... <<<")
+            plt.close(self.fig)
+            print(f"✓ Total drones placed: {len(self.controller.drones)}")
+            self.placement_complete = True
+            return
+        elif event.key == 'q':
+            print("\n>>> Quitting placement <<<")
+            self.placement_complete = False
+            plt.close(self.fig)
+            return
+        elif event.key == '+' or event.key == '=':
+            self.z_height += 10
+            print(f"\n>>> Altitude set to {self.z_height:.0f}m <<<")
+        elif event.key == '-' or event.key == '_':
+            self.z_height = max(10.0, self.z_height - 10)
+            print(f"\n>>> Altitude set to {self.z_height:.0f}m <<<")
+        else:
+            return
+        
+        # Update visuals for mode/altitude changes
+        self._update_title()
+        if self.mode_indicator:
+            self.mode_indicator.set_visible(False)
+        self.mode_indicator = None
+        self._draw_mode_indicator()
+        self.fig.canvas.draw()
+
+    def _redraw_drones(self):
+        self.ax.clear()
+        
+        # Redraw background
+        self.ax.set_xlim(0, self.area_size[0])
+        self.ax.set_ylim(0, self.area_size[1])
+        self.ax.set_xlabel('X Position (meters)', fontsize=12)
+        self.ax.set_ylabel('Y Position (meters)', fontsize=12)
+        self.ax.grid(True, alpha=0.3, linestyle='--')
+        self.ax.set_aspect('equal')
+        
+        # Redraw drones
+        for drone_id, drone in self.controller.drones.items():
+            if drone.drone_type == DroneType.LEADER:
+                color = 'red'
+                marker = 's'
+                size = 150
+            else:
+                color = 'blue'
+                marker = 'o'
+                size = 100
+            
+            self.ax.scatter(drone.position.x, drone.position.y, 
+                            c=color, marker=marker, s=size, alpha=0.7,
+                            edgecolors='black', linewidth=1.5, zorder=3)
+            
+            # Draw communication range circle
+            range_circle = Circle((drone.position.x, drone.position.y), 
+                                  drone.communication_range, 
+                                  color=color, fill=False, 
+                                  linestyle='--', alpha=0.15, zorder=2)
+            self.ax.add_patch(range_circle)
+            
+            # Add drone ID label
+            self.ax.text(drone.position.x, drone.position.y + 80, 
+                         drone_id, fontsize=8, ha='center',
+                         fontweight='bold',
+                         bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8))
+        
+        # Redraw persistent elements
+        self._update_title()
+        self._add_legend()
+        self._add_instructions()
+        self.mode_indicator = None
+        self._draw_mode_indicator()
+        
+        self.fig.canvas.draw()
+
 
 # ============= INTERACTIVE MAIN FUNCTION =============
 
@@ -698,39 +1149,88 @@ def run_interactive_aco():
     print("INTERACTIVE ACO ROUTING SIMULATOR")
     print("="*70)
     
-    controller = InteractiveACOController()
-    
-    # Setup phase
+    # Setup phase with graphical placement
     print("\n📋 SETUP PHASE")
     print("-" * 70)
+    print("Choose drone placement method:")
+    print("  [1] Graphical placement (click to place drones)")
+    print("  [2] Random automatic placement")
     
-    num_drones = int(input("Enter number of drones (recommended 15-30): ").strip() or "20")
-    controller.initialize_swarm(num_drones)
+    choice = input("\nEnter choice (1 or 2, default=1): ").strip() or "1"
+    
+    if choice == "1":
+        # Graphical placement
+        print("\n🖱️  Opening graphical placement interface...")
+        print("    Click on the map to place drones!")
+        placement_gui = GraphicalDronePlacement(area_size=(2000, 2000))
+        placement_complete = placement_gui.start_placement_interface()
+        
+        if not placement_complete:
+            print("\n❌ Placement cancelled. Exiting.")
+            return
+        
+        controller = placement_gui.controller
+        
+        if len(controller.drones) < 2:
+            print("\n❌ Need at least 2 drones. Exiting.")
+            return
+    else:
+        # Automatic random placement
+        controller = InteractiveACOController()
+        num_drones = int(input("Enter number of drones (recommended 15-30): ").strip() or "20")
+        controller.initialize_swarm(num_drones)
+    
+    # Initialize neighbor relationships
+    print("\n🔄 Calculating neighbor relationships...")
+    controller.update_neighbor_relationships()
     
     print("\n✓ Network initialized successfully!")
     print(f"  Total drones: {len(controller.drones)}")
     
-    # Show available drones
-    drone_list = sorted(controller.drones.keys())
-    print(f"\n📡 Available drones:")
-    for i, drone_id in enumerate(drone_list, 1):
-        drone = controller.drones[drone_id]
-        dtype = "LEADER" if drone.drone_type == DroneType.LEADER else "WORKER"
-        print(f"  [{i:2d}] {drone_id:12s} ({dtype})")
+    # Show network overview
+    controller.show_network_overview()
+    
     
     # Main simulation loop
     while True:
+
+        # Show available drones
+        drone_list = sorted(controller.drones.keys())
+        print(f"\n📡 Available drones:")
+        for i, drone_id in enumerate(drone_list, 1):
+            drone = controller.drones[drone_id]
+            dtype = "LEADER" if drone.drone_type == DroneType.LEADER else "WORKER"
+            neighbors = len(drone.neighbor_drones)
+            print(f"  [{i:2d}] {drone_id:12s} ({dtype}) - {neighbors} neighbors")
+
         print("\n" + "="*70)
         print(f"ROUND SELECTION (Current Round: {controller.round_number})")
         print("="*70)
         
+        # Quick options
+        print("\n📋 Quick options:")
+        print("  [n] Show network overview")
+        print("  [v] View network visualization")
+        print("  [h] View round history")
+        print("  [q] Quit simulator")
+        print("\n  Or enter source drone to continue...")
+        
         # Get source node
         print("\n🎯 Select SOURCE node:")
-        source_input = input("  Enter drone ID or number from list above: ").strip()
+        source_input = input("  Enter drone ID, number, or command: ").strip()
         
         if source_input.lower() in ['quit', 'exit', 'q']:
             print("\n👋 Exiting simulator. Goodbye!")
             break
+        elif source_input.lower() == 'n':
+            controller.show_network_overview()
+            continue
+        elif source_input.lower() == 'v':
+            controller.visualize_network_static()
+            continue
+        elif source_input.lower() == 'h':
+            print_round_history(controller)
+            continue
         
         # Parse source
         if source_input.isdigit():

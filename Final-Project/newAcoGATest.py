@@ -62,7 +62,7 @@ class RouteResult:
 
 class ForwardAnt:
     def __init__(self, ant_id: str, source_drone: 'UnifiedDrone', destination_drone: 'UnifiedDrone', 
-                 ant_type: AntType = AntType.EXPLORATORY):
+                 ant_type: AntType = AntType.EXPLORATORY, path_to_repair: Optional[List[str]] = None):
         self.ant_id = ant_id
         self.source_drone = source_drone
         self.destination_drone = destination_drone
@@ -74,6 +74,11 @@ class ForwardAnt:
         self.max_hops = 20
         self.ttl = 30.0
         self.emergency_flag = False
+        
+        # --- NEW ---
+        # The old path we are trying to follow/repair
+        self.path_to_repair = path_to_repair
+        # --- END NEW ---
         
     def record_hop(self, drone_id: str, link_quality: float, position: Position):
         self.path_taken.append({
@@ -281,30 +286,45 @@ class UnifiedDrone:
         with self.lock:
             self.ants_processed += 1
             
-            # === THIS IS THE FIX ===
             # Calculate the real link quality of the hop we just made
-            # instead of just 'link_quality = 1.0'
             link_quality = 1.0  # Default for the first hop (the source drone)
             if ant.path_taken:
-                # If we have a path, find the previous drone
                 previous_drone_id = ant.path_taken[-1]['drone_id']
                 if previous_drone_id in self.neighbor_drones:
-                    # Get the quality of the link we just traversed
                     link_metrics = self.neighbor_drones[previous_drone_id]
                     link_quality = link_metrics.rssi / 100.0
                 else:
-                    # This node is no longer a neighbor (or was never), penalize
                     link_quality = 0.1 
-            # === END OF FIX ===
             
             ant.record_hop(self.drone_id, link_quality, self.position)
             
             if self.drone_id == ant.destination_drone.drone_id:
-                return None
-                
+                return None # Reached destination
             if not ant.should_continue():
-                return None
+                return None # Ant expired
+
+            # --- NEW REPAIR LOGIC ---
+            if ant.path_to_repair:
+                # Check if we are still on the original path
+                # ant.hop_count is 1-based (source is 1st hop)
+                # path_to_repair is 0-indexed (source is index 0)
+                if self.drone_id == ant.path_to_repair[ant.hop_count - 1]:
+                    # We are on the path. Check if the *next* step is valid.
+                    if ant.hop_count < len(ant.path_to_repair):
+                        old_next_hop_id = ant.path_to_repair[ant.hop_count]
+                        
+                        # Check if the old next hop is still a neighbor
+                        if old_next_hop_id in self.neighbor_drones:
+                            # Path is still valid. Follow it.
+                            return old_next_hop_id
+                    # else: we are at the last node (destination), let logic fall through
                 
+                # If we are here, the path is broken or we're off-path.
+                # Stop following and start exploring.
+                ant.path_to_repair = None 
+            # --- END OF REPAIR LOGIC ---
+
+            # If path_to_repair is None (or just broke), explore normally:
             available_neighbors = self.get_available_neighbors_aco(ant)
             if not available_neighbors:
                 return None
@@ -570,7 +590,12 @@ class ACOvsGAController:
         self.drones: Dict[str, UnifiedDrone] = {}
         self.running = False
         self.simulation_time = 0
-        self.ant_counter = 0
+        self.ant_counter = 0  # <-- THIS IS THE FIX
+        
+        # --- NEW ---
+        # Stores the best route found for a (source, dest) pair
+        self.established_routes_aco: Dict[Tuple[str, str], RouteResult] = {}
+        # --- END NEW ---
         
         # ACO parameters
         self.aco_params = {
@@ -724,6 +749,60 @@ class ACOvsGAController:
                 path_quality=0.0
             )
         
+    def _send_single_ant_aco(self, source_id: str, dest_id: str) -> RouteResult:
+        start_time = time.time()
+        source_drone = self.drones[source_id]
+        dest_drone = self.drones[dest_id]
+        
+        # Create forward ant with advanced features
+        ant = ForwardAnt(f"ant_{self.ant_counter}", source_drone, dest_drone, AntType.EXPLORATORY)
+        self.ant_counter += 1
+        
+        current_drone = source_drone
+        max_time = 2.0
+        
+        while current_drone and ant.should_continue() and (time.time() - start_time) < max_time:
+            next_hop_id = current_drone.process_forward_ant_aco(ant)
+            
+            if not next_hop_id or next_hop_id not in self.drones:
+                break
+                
+            current_drone = self.drones[next_hop_id]
+        
+        # Process backward ant if successful
+        if ant.path_taken and ant.path_taken[-1]['drone_id'] == dest_id:
+            backward_ant = BackwardAnt(ant)
+            backward_ant.calculate_path_metrics()
+            backward_ant.update_pheromones(self.drones)
+            
+            route = [hop['drone_id'] for hop in ant.path_taken]
+            latency = time.time() - start_time
+            path_quality = ant.calculate_current_path_quality()
+            
+            return RouteResult(
+                algorithm=AlgorithmType.ACO,
+                source=source_id,
+                destination=dest_id,
+                route=route,
+                latency=latency,
+                hop_count=len(route) - 1,
+                success=True,
+                timestamp=time.time(),
+                path_quality=path_quality
+            )
+        else:
+            return RouteResult(
+                algorithm=AlgorithmType.ACO,
+                source=source_id,
+                destination=dest_id,
+                route=None,
+                latency=time.time() - start_time,
+                hop_count=0,
+                success=False,
+                timestamp=time.time(),
+                path_quality=0.0
+            )
+        
     def test_aco_routing(self, source_id: str, dest_id: str) -> RouteResult:
         """
         Runs a full ACO search for a specific route over a set duration.
@@ -766,6 +845,12 @@ class ACOvsGAController:
             
             # Set the latency to the *total* time the search took
             best_route.latency = time.time() - start_time
+            
+            # --- NEW ---
+            # Save this as the new "best" route for maintenance
+            self.established_routes_aco[(source_id, dest_id)] = best_route
+            # --- END NEW ---
+            
             return best_route
         else:
             # No route was found in the 2-second window
@@ -1080,6 +1165,11 @@ class ACOvsGAController:
                     self.run_comparison_test()
                     self.last_test_time = self.simulation_time
                 
+                # --- NEW ---
+                # Run the ACO route maintenance cycle
+                self.run_aco_route_maintenance()
+                # --- END NEW ---
+                
                 # Update network
                 self.update_drone_positions()
                 self.update_neighbor_relationships()
@@ -1298,6 +1388,74 @@ class ACOvsGAController:
                 backward_ant = BackwardAnt(ant)
                 backward_ant.calculate_path_metrics()
                 backward_ant.update_pheromones(self.drones)
+
+    def run_aco_route_maintenance(self):
+        """
+        Periodically checks established ACO routes.
+        If a route is broken, launches a repair ant.
+        """
+        if not self.established_routes_aco:
+            return
+
+        # Check one established route per cycle to avoid overload
+        (source_id, dest_id) = random.choice(list(self.established_routes_aco.keys()))
+        route_result = self.established_routes_aco[(source_id, dest_id)]
+        path = route_result.route
+        
+        # Check path validity
+        is_valid = self.is_path_valid(path)
+        
+        if not is_valid:
+            print(f"⚠️ ACO Route {source_id} -> {dest_id} is BROKEN! Launching repair ant.")
+            # Path is broken, launch a repair ant
+            self._send_repair_ant(source_id, dest_id, path)
+            # Remove the old, broken path from memory
+            del self.established_routes_aco[(source_id, dest_id)]
+
+    def is_path_valid(self, path: List[str]) -> bool:
+        """Checks if a given path is still valid"""
+        for i in range(len(path) - 1):
+            current_node_id = path[i]
+            next_node_id = path[i+1]
+            if current_node_id not in self.drones or next_node_id not in self.drones:
+                return False
+            current_drone = self.drones[current_node_id]
+            if next_node_id not in current_drone.neighbor_drones:
+                return False # Link is broken
+        return True
+
+    def _send_repair_ant(self, source_id: str, dest_id: str, old_path: List[str]):
+        """Launches a single ant in 'repair mode'"""
+        source_drone = self.drones.get(source_id)
+        dest_drone = self.drones.get(dest_id)
+        if not source_drone or not dest_drone:
+            return
+
+        # Create an ant with the path_to_repair
+        ant = ForwardAnt(f"ant_repair_{self.ant_counter}", 
+                        source_drone, dest_drone, 
+                        AntType.EMERGENCY, # Use emergency for faster heuristic
+                        path_to_repair=old_path)
+        self.ant_counter += 1
+        
+        # Launch the ant (similar to _send_single_ant_aco)
+        current_drone = source_drone
+        max_time = 2.0
+        start_time = time.time()
+        
+        while current_drone and ant.should_continue() and (time.time() - start_time) < max_time:
+            next_hop_id = current_drone.process_forward_ant_aco(ant)
+            if not next_hop_id or next_hop_id not in self.drones:
+                break
+            current_drone = self.drones[next_hop_id]
+        
+        # If repair was successful, update pheromones
+        if ant.path_taken and ant.path_taken[-1]['drone_id'] == dest_id:
+            print(f"✓ Repair ant found new path: {' -> '.join([hop['drone_id'] for hop in ant.path_taken])}")
+            backward_ant = BackwardAnt(ant)
+            backward_ant.calculate_path_metrics()
+            backward_ant.update_pheromones(self.drones)
+        # No else needed, if it fails, it just fails.
 
     def reset_all_pheromones(self):
         """Calls reset_pheromones on every drone in the network."""
