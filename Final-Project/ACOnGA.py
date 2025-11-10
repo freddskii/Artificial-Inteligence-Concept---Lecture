@@ -108,21 +108,32 @@ class BackwardAnt:
         self.timestamp = time.time()
         
     def calculate_path_metrics(self) -> Dict[str, float]:
-        if not self.forward_ant.path_taken:
+        # --- THIS IS THE FIX ---
+        # We must skip the first hop (the source node) in our calculation,
+        # because its link_quality is always a meaningless default of 1.0.
+        # We only care about the quality of the *links* we traversed.
+        
+        path_links = self.forward_ant.path_taken[1:] # Slice to skip hop 0
+        
+        if not path_links:
+            # The path was just the source node (ant failed immediately)
             return {}
             
-        total_quality = sum(hop['link_quality'] for hop in self.forward_ant.path_taken)
-        avg_quality = total_quality / len(self.forward_ant.path_taken)
-        hop_penalty = len(self.forward_ant.path_taken) * 0.1
+        total_quality = sum(hop['link_quality'] for hop in path_links)
+        avg_quality = total_quality / len(path_links) # Divide by the number of links
         
-        # Apply emergency boost if needed
+        # Hops are (nodes - 1), which is len(path_links)
+        hop_count = len(path_links) 
+        hop_penalty = hop_count * 0.1
+        # --- END OF FIX ---
+        
         if self.emergency_flag:
             avg_quality *= 1.2
         
         self.path_quality_score = avg_quality - hop_penalty
         return {
             'quality_score': self.path_quality_score,
-            'hop_count': len(self.forward_ant.path_taken),
+            'hop_count': hop_count,
             'avg_quality': avg_quality
         }
         
@@ -277,7 +288,7 @@ class UnifiedDrone:
     
     # ===== ADVANCED ACO METHODS =====
     
-    def process_forward_ant_aco(self, ant: ForwardAnt) -> Optional[str]:
+    def process_forward_ant_aco(self, ant: ForwardAnt, drone_network: Dict[str, 'UnifiedDrone']) -> Optional[str]:
         with self.lock:
             self.ants_processed += 1
             
@@ -309,9 +320,11 @@ class UnifiedDrone:
             if not available_neighbors:
                 return None
                 
+            # --- THIS CALL IS MODIFIED ---
             next_hop_id = self.advanced_routing_decision_aco(
-                available_neighbors, ant.destination_drone, ant.ant_type
+                available_neighbors, ant.destination_drone, drone_network, ant.ant_type
             )
+            # --- END MODIFICATION ---
             return next_hop_id
             
     def get_available_neighbors_aco(self, ant: ForwardAnt) -> List[str]:
@@ -326,6 +339,7 @@ class UnifiedDrone:
         
     def advanced_routing_decision_aco(self, available_neighbors: List[str], 
                                      destination: 'UnifiedDrone',
+                                     drone_network: Dict[str, 'UnifiedDrone'],
                                      ant_type: AntType = AntType.EXPLORATORY) -> str:
         """Advanced probabilistic routing with heuristic integration"""
         if not available_neighbors:
@@ -357,22 +371,11 @@ class UnifiedDrone:
             
             # === THIS IS THE FIX ===
             # Calculate a real heuristic based on available link metrics
-            # instead of just 'heuristic = 0.7'
             heuristic = 0.1  # Default low value
-            if neighbor_id in self.neighbor_drones:
-                link_metrics = self.neighbor_drones[neighbor_id]
-                
-                # 1. Use RSSI as a measure of link quality
-                link_quality = link_metrics.rssi / 100.0
-                
-                # 2. Use latency as a proxy for distance (lower is better)
-                # Normalize latency. Assume 20.0 (2000m * 0.01) is max.
-                # 1.0 - (latency / 20.0) gives a "closeness" score.
-                distance_score = max(0, 1.0 - (link_metrics.latency / 20.0))
-                
-                # Combine factors (70% quality, 30% distance)
-                heuristic = (0.7 * link_quality) + (0.3 * distance_score)
-                heuristic = max(0.1, heuristic) # Ensure it's non-zero
+            if neighbor_id in drone_network: # Use passed-in drone_network
+                neighbor_drone = drone_network[neighbor_id] # Use passed-in drone_network
+                # Use the actual heuristic calculation
+                heuristic = self.calculate_heuristic(neighbor_drone, destination)
             # === END OF FIX ===
             
             # Calculate probability
@@ -627,16 +630,35 @@ class ACOvsGAController:
     def update_neighbor_relationships(self):
         drone_ids = list(self.drones.keys())
         
+        # --- FIX: Clear all neighbor lists FIRST ---
+        for drone_id in drone_ids:
+            if drone_id in self.drones:
+                self.drones[drone_id].neighbor_drones.clear()
+        # --- END FIX ---
+        
         for i, drone_id1 in enumerate(drone_ids):
             drone1 = self.drones[drone_id1]
-            drone1.neighbor_drones.clear()
+            # The line 'drone1.neighbor_drones.clear()' was here and has been REMOVED
             
             for drone_id2 in drone_ids[i+1:]:
                 drone2 = self.drones[drone_id2]
                 distance = drone1.position.distance_to(drone2.position)
                 
-                if distance <= drone1.communication_range:
-                    link_quality = drone1.measure_link_quality(drone2)
+                # Check if EITHER drone can reach the other
+                max_range = max(drone1.communication_range, drone2.communication_range)
+                
+                if distance <= max_range:
+                    # Calculate quality based on the range that *made* the connection
+                    los_quality = 1.0 - (distance / max_range) ** 2
+                    
+                    signal_boost = 1.2 if (drone1.drone_type == DroneType.LEADER or 
+                                            drone2.drone_type == DroneType.LEADER) else 1.0
+                    
+                    energy_factor = min(drone1.battery_level, drone2.battery_level) / 100.0
+                    
+                    link_quality = los_quality * signal_boost * energy_factor
+                    link_quality = max(0.0, min(1.0, link_quality))
+
                     if link_quality > 0.1:
                         link_metrics = LinkMetrics(
                             rssi=link_quality * 100,
@@ -663,6 +685,7 @@ class ACOvsGAController:
             drone.update_position(new_position)
 
     # Advanced ACO routing test
+    # Advanced ACO routing test
     def test_aco_routing(self, source_id: str, dest_id: str) -> RouteResult:
         start_time = time.time()
         source_drone = self.drones[source_id]
@@ -676,7 +699,9 @@ class ACOvsGAController:
         max_time = 2.0
         
         while current_drone and ant.should_continue() and (time.time() - start_time) < max_time:
-            next_hop_id = current_drone.process_forward_ant_aco(ant)
+            # --- THIS LINE IS MODIFIED ---
+            next_hop_id = current_drone.process_forward_ant_aco(ant, self.drones)
+            # --- END MODIFICATION ---
             
             if not next_hop_id or next_hop_id not in self.drones:
                 break
@@ -1229,7 +1254,9 @@ class ACOvsGAController:
             start_time = time.time()
             
             while current_drone and ant.should_continue() and (time.time() - start_time) < max_time:
-                next_hop_id = current_drone.process_forward_ant_aco(ant)
+                # --- THIS LINE IS MODIFIED ---
+                next_hop_id = current_drone.process_forward_ant_aco(ant, self.drones)
+                # --- END MODIFICATION ---
                 if not next_hop_id or next_hop_id not in self.drones:
                     break
                 current_drone = self.drones[next_hop_id]
