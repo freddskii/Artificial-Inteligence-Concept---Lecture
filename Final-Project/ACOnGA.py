@@ -157,8 +157,11 @@ class GARouteChromosome:
         if not self.route or self.route[0] != self.source or self.route[-1] != self.destination:
             return 0.0
             
-        total_quality = 0.0
         hop_count = len(self.route) - 1
+        if hop_count == 0:
+            return 0.0
+
+        min_quality_in_path = 1.0  
         
         for i in range(hop_count):
             current_id = self.route[i]
@@ -168,19 +171,17 @@ class GARouteChromosome:
                 current = drone_network[current_id]
                 if next_id in current.neighbor_drones:
                     link_metrics = current.neighbor_drones[next_id]
-                    total_quality += link_metrics.rssi / 100.0
+                    link_quality = link_metrics.rssi / 100.0
+                    
+                    if link_quality < min_quality_in_path:
+                        min_quality_in_path = link_quality
                 else:
-                    return 0.0
+                    return 0.0 
             else:
-                return 0.0
+                return 0.0 
+        hop_penalty = hop_count * 0.01 
         
-        if hop_count == 0:
-            return 0.0
-            
-        avg_quality = total_quality / hop_count
-        hop_penalty = hop_count * 0.05
-        
-        self.fitness = max(0.1, avg_quality - hop_penalty)
+        self.fitness = max(0.1, min_quality_in_path - hop_penalty)
         return self.fitness
 
 class UnifiedDrone:
@@ -422,8 +423,7 @@ class UnifiedDrone:
             
         return route if route[-1] == destination_id else None
     
-    def find_route_ga(self, destination_id: str, drone_network: Dict[str, 'UnifiedDrone'],
-                     population_size: int = 20, generations: int = 10) -> Optional[List[str]]:
+    def find_route_ga(self, destination_id: str, drone_network: Dict[str, 'UnifiedDrone'], population_size: int = 20, generations: int = 10) -> Optional[List[str]]:
         cache_key = f"{self.drone_id}_{destination_id}"
         if cache_key in self.route_cache_ga:
             cached = self.route_cache_ga[cache_key]
@@ -877,9 +877,7 @@ class ACOvsGAController:
                     color_intensity = link_quality if link_qualities else 0.7
                     line_color = plt.cm.RdYlGn(color_intensity)
                     
-                    ax.plot([current.position.x, next_drone.position.x],
-                           [current.position.y, next_drone.position.y],
-                           color=line_color, linewidth=4, alpha=0.8, zorder=2)
+                    ax.plot([current.position.x, next_drone.position.x], [current.position.y, next_drone.position.y], color=line_color, linewidth=4, alpha=0.8, zorder=2)
                     
                     dx = next_drone.position.x - current.position.x
                     dy = next_drone.position.y - current.position.y
@@ -891,9 +889,7 @@ class ACOvsGAController:
                     mid_x = (current.position.x + next_drone.position.x) / 2
                     mid_y = (current.position.y + next_drone.position.y) / 2
                     hop_text = f"#{i+1}\n{link_quality*100:.0f}%" if link_qualities else f"#{i+1}"
-                    ax.text(mid_x, mid_y, hop_text, fontsize=7,
-                           bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.9),
-                           ha='center', fontweight='bold', zorder=4)
+                    ax.text(mid_x, mid_y, hop_text, fontsize=7, bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.9), ha='center', fontweight='bold', zorder=4)
         
         if result.success:
             title = f"{algo_name}: ✓ SUCCESS\n"
@@ -935,16 +931,15 @@ class ACOvsGAController:
         if len(drone_ids) < 2:
             return
         
-        test_pairs = []
-        for _ in range(min(5, len(drone_ids) // 2)):
-            source = random.choice(drone_ids)
-            dest = random.choice([d for d in drone_ids if d != source])
-            test_pairs.append((source, dest))
+        source = random.choice(drone_ids)
+        dest = random.choice([d for d in drone_ids if d != source])
+        
+        test_pairs = [(source, dest) for _ in range(5)]
         
         aco_results = []
         ga_results = []
         
-        for source, dest in test_pairs:
+        for idx, (source, dest) in enumerate(test_pairs):
             aco_result = self.test_aco_routing(source, dest)
             aco_results.append(aco_result)
             
@@ -955,7 +950,10 @@ class ACOvsGAController:
                 self.aco_metrics['path_qualities'].append(aco_result.path_quality)
             else:
                 self.aco_metrics['routes_failed'] += 1
-            
+
+            if source in self.drones:
+                self.drones[source].route_cache_ga.clear()
+
             ga_result = self.test_ga_routing(source, dest)
             ga_results.append(ga_result)
             
@@ -974,6 +972,7 @@ class ACOvsGAController:
         self.ga_metrics['success_rate'].append(ga_success_rate)
         
         test_number = len(self.comparison_results) + 1
+        
         self.visualize_test_round(test_pairs, aco_results, ga_results, test_number)
         
         self.comparison_results.append({
@@ -1211,8 +1210,7 @@ class InteractivePlacementGUI:
             transform=self.ax.transAxes,
             fontsize=11, fontweight='bold', color=color,
             verticalalignment='top',
-            bbox=dict(boxstyle='round,pad=0.8', facecolor='lightyellow', 
-                     alpha=0.9, edgecolor=color, linewidth=2),
+            bbox=dict(boxstyle='round,pad=0.8', facecolor='lightyellow', alpha=0.9, edgecolor=color, linewidth=2),
             zorder=10
         )
     
@@ -1220,10 +1218,8 @@ class InteractivePlacementGUI:
         from matplotlib.lines import Line2D
         
         legend_elements = [
-            Line2D([0], [0], marker='s', color='w', label='Leader Drone (2000m range)',
-                   markerfacecolor='red', markersize=12, alpha=0.7),
-            Line2D([0], [0], marker='o', color='w', label='Worker Drone (1000m range)',
-                   markerfacecolor='blue', markersize=10, alpha=0.7),
+            Line2D([0], [0], marker='s', color='w', label='Leader Drone (2000m range)', markerfacecolor='red', markersize=12, alpha=0.7),
+            Line2D([0], [0], marker='o', color='w', label='Worker Drone (1000m range)', markerfacecolor='blue', markersize=10, alpha=0.7),
             Line2D([0], [0], color='gray', alpha=0.3, label='Communication Range', linewidth=2)
         ]
         
@@ -1324,16 +1320,10 @@ class InteractivePlacementGUI:
                             c=color, marker=marker, s=size, alpha=0.7,
                             edgecolors='black', linewidth=1.2, zorder=3)
             
-            range_circle = Circle((drone.position.x, drone.position.y), 
-                                  drone.communication_range, 
-                                  color=color, fill=False, 
-                                  linestyle='--', alpha=0.2, zorder=2)
+            range_circle = Circle((drone.position.x, drone.position.y), drone.communication_range, color=color, fill=False, linestyle='--', alpha=0.2, zorder=2)
             self.ax.add_patch(range_circle)
             
-            self.ax.text(drone.position.x, drone.position.y + 60, 
-                         drone_id, fontsize=8, ha='center',
-                         fontweight='bold',
-                         bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.7))
+            self.ax.text(drone.position.x, drone.position.y + 60, drone_id, fontsize=8, ha='center', fontweight='bold', bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.7))
         
         self._update_title()
         self._add_legend()

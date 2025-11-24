@@ -212,7 +212,6 @@ class UnifiedDrone:
         with self.lock:
             self.ants_processed += 1
             
-            # === THIS IS THE FIX ===
             # Calculate the real link quality of the hop we just made
             # instead of just 'link_quality = 1.0'
             link_quality = 1.0  # Default for the first hop (the source drone)
@@ -226,7 +225,6 @@ class UnifiedDrone:
                 else:
                     # This node is no longer a neighbor (or was never), penalize
                     link_quality = 0.1 
-            # === END OF FIX ===
             
             ant.record_hop(self.drone_id, link_quality, self.position)
             
@@ -241,7 +239,7 @@ class UnifiedDrone:
                 return None
                 
             # --- THIS CALL IS MODIFIED ---
-            next_hop_id = self.advanced_routing_decision_aco(
+            next_hop_id = self.routing_decision_aco(
                 available_neighbors, ant.destination_drone, drone_network, ant.ant_type
             )
             # --- END MODIFICATION ---
@@ -257,7 +255,7 @@ class UnifiedDrone:
                 
         return available
         
-    def advanced_routing_decision_aco(self, available_neighbors: List[str], 
+    def routing_decision_aco(self, available_neighbors: List[str], 
                                      destination: 'UnifiedDrone',
                                      drone_network: Dict[str, 'UnifiedDrone'],
                                      ant_type: AntType = AntType.EXPLORATORY) -> str:
@@ -285,14 +283,12 @@ class UnifiedDrone:
                 
             pheromone = self.pheromone_table_aco[destination.drone_id][neighbor_id]
             
-            # === THIS IS THE FIX ===
             # Calculate a real heuristic based on available link metrics
             heuristic = 0.1  # Default low value
             if neighbor_id in drone_network: # Use passed-in drone_network
                 neighbor_drone = drone_network[neighbor_id] # Use passed-in drone_network
                 # Use the actual heuristic calculation
                 heuristic = self.calculate_heuristic(neighbor_drone, destination)
-            # === END OF FIX ===
 
             probability = (pheromone ** alpha) * (heuristic ** beta)
             probabilities.append((neighbor_id, probability))
@@ -309,7 +305,7 @@ class UnifiedDrone:
         return random.choice(available_neighbors)
     
     def update_pheromone_aco(self, destination_id: str, neighbor_id: str, path_quality: float):
-        evaporation_rate = 0.3
+        evaporation_rate = 0.3 # <<<<<
         Q = 2.0
         
         with self.lock:
@@ -348,7 +344,7 @@ class InteractiveACOController:
         self.round_number = 0
         
         # ACO parameters
-        self.aco_params = {
+        self.aco_params = { # <<<<<<
             'alpha': 0.6,
             'beta': 0.4,
             'rho': 0.3,
@@ -388,15 +384,12 @@ class InteractiveACOController:
     def update_neighbor_relationships(self):
         drone_ids = list(self.drones.keys())
         
-        # --- FIX: Clear all neighbor lists FIRST ---
         for drone_id in drone_ids:
             if drone_id in self.drones:
                 self.drones[drone_id].neighbor_drones.clear()
-        # --- END FIX ---
         
         for i, drone_id1 in enumerate(drone_ids):
             drone1 = self.drones[drone_id1]
-            # The line 'drone1.neighbor_drones.clear()' was here and has been REMOVED
             
             for drone_id2 in drone_ids[i+1:]:
                 drone2 = self.drones[drone_id2]
@@ -1279,9 +1272,15 @@ def run_interactive_aco():
         print("  [2] Fresh start (reset all pheromones)")
         reset_choice = input("  Enter choice (1 or 2, default=1): ").strip() or "1"
         reset_pheromones = (reset_choice == "2")
+
+        print("\n How long the simulation will last?")
+        duration = int(input("Enter how many seconds?"))
+
+        if not duration:
+            duration = 10
         
         # Run the round
-        controller.run_round(source_id, dest_id, duration=10, reset_pheromones=reset_pheromones)
+        controller.run_round(source_id, dest_id, duration, reset_pheromones=reset_pheromones)
         
         # Post-round options
         print("\n" + "="*70)
@@ -1301,7 +1300,6 @@ def run_interactive_aco():
         elif choice == "4":
             print("\n👋 Exiting simulator. Goodbye!")
             break
-        # Otherwise loop continues for new round
 
 
 def print_round_history(controller: InteractiveACOController):
@@ -1348,8 +1346,8 @@ def print_round_history(controller: InteractiveACOController):
 if __name__ == "__main__":
     print("""
 ╔════════════════════════════════════════════════════════════════════╗
-║           INTERACTIVE ACO ROUTING SIMULATOR                         ║
-║                 Ant Colony Optimization for Drone Networks          ║
+║           INTERACTIVE ACO ROUTING SIMULATOR                        ║
+║                 Ant Colony Optimization for Drone Networks         ║
 ╚════════════════════════════════════════════════════════════════════╝
 
 This simulator allows you to:
